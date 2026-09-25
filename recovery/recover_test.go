@@ -172,21 +172,55 @@ func TestRecoverRejectsUnknownOperation(t *testing.T) {
 	}
 }
 
-func TestRecoverRejectsMalformedWAL(t *testing.T) {
-	walPath := filepath.Join(t.TempDir(), "data.jsonl")
+func TestRecoverTruncatesPartialFinalRecord(t *testing.T) {
+	walPath := writeTestWAL(t, []persistence.WALRecord{
+		{
+			Operation: "set",
+			Key:       "name",
+			Value:     "Sarthak",
+		},
+	})
 
-	err := os.WriteFile(
-		walPath,
-		[]byte(`{"op":"set","key":"name","value":"Sarthak"
-`),
-		0644,
-	)
+	expectedWAL, err := os.ReadFile(walPath)
 	if err != nil {
-		t.Fatalf("failed to write malformed WAL: %v", err)
+		t.Fatalf("failed to read valid WAL: %v", err)
 	}
 
-	_, err = Recover(walPath)
-	if err == nil {
-		t.Fatal("Recover returned nil, want an error")
+	file, err := os.OpenFile(walPath, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		t.Fatalf("failed to open WAL: %v", err)
+	}
+
+	_, err = file.WriteString(`{"op":"set","key":"city","value":"Del`)
+	if err != nil {
+		file.Close()
+		t.Fatalf("failed to write partial WAL record: %v", err)
+	}
+
+	err = file.Close()
+	if err != nil {
+		t.Fatalf("failed to close WAL: %v", err)
+	}
+
+	data, err := Recover(walPath)
+	if err != nil {
+		t.Fatalf("Recover returned an unexpected error: %v", err)
+	}
+
+	if data["name"] != "Sarthak" {
+		t.Fatalf("name = %q, want %q", data["name"], "Sarthak")
+	}
+
+	if _, exists := data["city"]; exists {
+		t.Fatal("city exists after recovery, want it to be absent")
+	}
+
+	recoveredWAL, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("failed to read recovered WAL: %v", err)
+	}
+
+	if string(recoveredWAL) != string(expectedWAL) {
+		t.Fatal("WAL was not truncated back to the last valid record")
 	}
 }

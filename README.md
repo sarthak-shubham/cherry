@@ -2,15 +2,16 @@
 
 A concurrent, persistent key-value store built from scratch in Go.
 
-Cherry keeps active data in memory, uses a JSONL write-ahead log (WAL) for durability, replays the WAL on startup for recovery, and exposes the store through an HTTP API and CLI client.
+Cherry keeps active data in memory, uses a JSONL write-ahead log (WAL) for persistence, replays the WAL on startup for recovery, and exposes the store through an HTTP API and CLI client.
 
 ## Features
 
 * In-memory key-value storage using `map[string]string`
 * Concurrent access protected by `sync.RWMutex`
 * JSONL write-ahead log for persistent writes
-* WAL is synced before the in-memory state is updated
+* WAL write validation and rollback on failed or partial writes
 * Startup recovery by replaying WAL records in order
+* Automatic removal of an incomplete final WAL record after a crash
 * HTTP/JSON API for `GET`, `PUT`, and `DELETE`
 * CLI client for interacting with the running server
 * Unit, integration, API, client, and concurrency tests
@@ -48,7 +49,9 @@ Example:
 
 ```text
 name = Robert
+
 name = Robert
+
 deleted name
 ```
 
@@ -61,7 +64,7 @@ go run ./client set name Robert
 go run ./client set city Tokyo
 ```
 
-Stop the server, start it again:
+Stop the server and start it again:
 
 ```bash
 go run .
@@ -129,14 +132,20 @@ Write lock
   ↓
 Append WAL record
   ↓
-Sync WAL to disk
+Sync WAL
   ↓
 Update in-memory map
   ↓
 Return success
 ```
 
-The in-memory state is updated only after the WAL append and sync succeed.
+Cherry writes the WAL record before updating the in-memory map.
+
+If the WAL write fails or is incomplete, Cherry attempts to roll the WAL back to its previous size and returns an error for that request. The in-memory map is not changed.
+
+If the WAL record is written successfully but `Sync()` fails, Cherry logs a warning and continues serving. The operation is applied to the in-memory map, but its durability after a crash cannot be guaranteed.
+
+A failure affecting one write therefore does not terminate the server or prevent other requests from being served.
 
 ### Read path
 
@@ -158,17 +167,27 @@ Cherry rebuilds its in-memory state from the WAL when the application starts:
 
 ```text
 WAL
- ↓
+  ↓
 Replay records in order
- ↓
+  ↓
 Rebuild map
- ↓
+  ↓
 Create Store
- ↓
+  ↓
 Start HTTP server
 ```
 
 A `set` record creates or replaces a value, while a `delete` record removes the key.
+
+Cherry handles different WAL startup conditions differently:
+
+* **WAL does not exist:** Cherry starts with an empty map. This is treated as a fresh start.
+* **WAL exists but is empty:** Cherry starts with an empty map.
+* **WAL ends with an incomplete final record:** Cherry truncates the incomplete tail and recovers all preceding complete records.
+* **WAL cannot be opened or read:** Recovery fails because Cherry cannot safely determine the persisted state.
+* **A complete WAL record contains invalid JSON or an unknown operation:** Recovery fails rather than silently discarding persisted data.
+
+Cherry therefore does not treat an existing but unreadable or corrupt WAL as an empty database. Doing so could silently discard previously persisted data.
 
 ## Concurrency
 
@@ -213,7 +232,11 @@ Keeping the active dataset in a Go map keeps the implementation simple and makes
 
 ### WAL before memory mutation
 
-Cherry appends and syncs a WAL record before changing the in-memory state. This keeps the persisted operation ahead of the in-memory state.
+Cherry writes the WAL record before changing the in-memory state.
+
+A failed or incomplete WAL write prevents the in-memory mutation.
+
+If the record is written successfully but `Sync()` fails, Cherry favors availability and continues serving while warning that durability is uncertain.
 
 ### `RWMutex`
 
@@ -221,7 +244,11 @@ A single `RWMutex` keeps the concurrency model simple and easy to reason about. 
 
 ### Synchronous WAL writes
 
-Each write is synced before being treated as successful. This favors durability over write throughput.
+Cherry attempts to sync each WAL record before treating its durability as guaranteed.
+
+If `Sync()` fails after the record has been successfully written, Cherry logs the failure and continues serving rather than rejecting the operation.
+
+This favors availability over guaranteeing durability in the face of a filesystem sync failure.
 
 ### JSONL WAL
 
@@ -235,9 +262,13 @@ Cherry is intentionally a small single-node project.
 * WAL growth is currently unbounded
 * No snapshots or WAL compaction
 * No replication or clustering
-* No recovery strategy for truncated or partially written WAL records
+* No distributed recovery or failover
 
-There is also an edge case around filesystem failures: a WAL record may be written before the subsequent `Sync` operation fails. In that case, the operation can be reported as unsuccessful even though the record may remain in the WAL. This version does not attempt transactional rollback of filesystem state.
+Filesystem failures can still create durability limitations.
+
+In particular, if a WAL record is successfully written but `Sync()` fails, Cherry accepts the operation in memory while logging a warning. The operation may therefore be lost after a crash if the data was not durably flushed to disk.
+
+More advanced storage and recovery mechanisms are outside the scope of the current version.
 
 ## License
 

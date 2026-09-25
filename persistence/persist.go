@@ -2,6 +2,9 @@ package persistence
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"os"
 )
 
@@ -19,12 +22,45 @@ func AppendLog(path string, record WALRecord) error {
 
 	defer file.Close()
 
-	encoder := json.NewEncoder(file)
-
-	err = encoder.Encode(record)
+	info, err := file.Stat()
 	if err != nil {
 		return err
 	}
 
-	return file.Sync()
+	startSize := info.Size()
+
+	data, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+
+	data = append(data, '\n')
+
+	written, err := file.Write(data)
+
+	if err != nil || written != len(data) {
+		truncateErr := file.Truncate(startSize)
+
+		if truncateErr != nil {
+			if err != nil {
+				return fmt.Errorf("WAL write failed: %v; WAL rollback failed: %w", err, truncateErr)
+			}
+
+			return fmt.Errorf("WAL write failed: %w; WAL rollback failed: %v", io.ErrShortWrite, truncateErr)
+		}
+
+		if err != nil {
+			return err
+		}
+
+		return io.ErrShortWrite
+	}
+
+	err = file.Sync()
+
+	if err != nil {
+		log.Printf("warning: WAL sync failed: %v", err)
+	}
+
+	return nil
 }
